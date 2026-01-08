@@ -22,3 +22,5 @@ gemini-gcloud-key.json,
 pycache
 gcp-oauth.keys.json,
 gemini-gcloud-key.json
+gcp-oauth.keys.json
+*key.json
