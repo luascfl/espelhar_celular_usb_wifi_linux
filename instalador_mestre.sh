@@ -1,234 +1,381 @@
 #!/bin/bash
+# Instalador mestre: acesso remoto (SSH, RustDesk), espelhamento (scrcpy) e servidor RustDesk no GCP.
+#
+# Parte local (PC):   status | enable | disable
+# Parte nuvem (GCP):  gcp-status | gcp-enable | gcp-disable --confirm-delete
+set -uo pipefail
 
 # Cores para logs
 GREEN='\033[0;32m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo -e "${GREEN}======================================================${NC}"
-echo -e "${GREEN}   INSTALADOR MESTRE: ACESSO REMOTO & SERVIDOR (GCP)  ${NC}"
-echo -e "${GREEN}======================================================${NC}"
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_HOME="${TARGET_HOME:-$HOME}"
+STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-$TARGET_HOME/.local/state}/lubuntu-optimize}"
+UFW_STATE="$STATE_DIR/espelhar-ufw-added"
+APP_DIR="${APP_DIR:-$TARGET_HOME/.local/share/applications}"
+LAUNCHER="$APP_DIR/espelhar_auto.desktop"
+MIRROR_SCRIPT="$SCRIPT_DIR/espelhar_auto.sh"
+RUSTDESK_VERSION="${RUSTDESK_VERSION:-1.4.4}"
+RUSTDESK_URL="https://github.com/rustdesk/rustdesk/releases/download/${RUSTDESK_VERSION}/rustdesk-${RUSTDESK_VERSION}-x86_64.deb"
+PACKAGES=(openssh-server ufw adb wget)
+# regra ufw (argumento de "ufw allow")
+UFW_RULES=("22/tcp" "5555/tcp" "1714:1764/udp" "1714:1764/tcp" "21115:21119/tcp" "21116/udp")
 
-# ==============================================================================
-# PARTE 1: CONFIGURAÇÃO LOCAL (PC)
-# ==============================================================================
+GCP_KEY_FILE="${GCP_KEY_FILE:-$SCRIPT_DIR/gemini-gcloud-key.json}"
+GCP_INSTANCE="${GCP_INSTANCE:-rustdesk-server}"
+GCP_ZONE="${GCP_ZONE:-us-central1-f}"   # zona elegível para free tier
+GCP_FIREWALL_RULE="allow-rustdesk"
 
-echo -e "\n${GREEN}[PARTE 1] Configurando seu Computador Local...${NC}"
+STATUS_FAIL=0
 
-# 1. Atualizar repositórios e instalar dependências básicas
-echo "Instalando dependências..."
-sudo apt update
-sudo apt install -y openssh-server ufw adb wget
+usage() {
+    cat <<EOF
+Uso:
+  $SCRIPT_NAME status                 confere a parte local (somente leitura)
+  $SCRIPT_NAME enable                 instala e habilita o que faltar na parte local
+  $SCRIPT_NAME disable                desabilita SSH/RustDesk que este script habilitou, remove o atalho e as
+                                      regras de firewall que ele adicionou (pacotes são mantidos)
+  $SCRIPT_NAME gcp-status             confere regra de firewall e VM do servidor RustDesk no GCP (somente leitura)
+  $SCRIPT_NAME gcp-enable             cria a regra de firewall e a VM no GCP se ainda não existirem
+                                      (projeto atual do gcloud ou GCP_PROJECT_ID; sem perguntas interativas)
+  $SCRIPT_NAME gcp-disable --confirm-delete
+                                      APAGA a VM e a regra de firewall do GCP (exige a confirmação explícita)
 
-# 2. Configurar SSH (Terminal Remoto)
-echo "Configurando SSH Permanente..."
-sudo systemctl enable --now ssh
-
-# 3. Configurar Firewall (UFW)
-echo "Configurando Firewall..."
-# SSH
-sudo ufw allow 22/tcp
-# ADB (Scrcpy Wi-Fi)
-sudo ufw allow 5555/tcp
-# KDE Connect (caso use)
-sudo ufw allow 1714:1764/udp
-sudo ufw allow 1714:1764/tcp
-# RustDesk (Acesso direto)
-sudo ufw allow 21115:21119/tcp
-sudo ufw allow 21116/udp
-sudo ufw reload
-echo "Regras de Firewall aplicadas."
-
-# 4. Instalar RustDesk (Acesso Visual Permanente)
-echo "Verificando RustDesk..."
-if ! systemctl is-active --quiet rustdesk; then
-    echo "Instalando RustDesk..."
-    wget -O /tmp/rustdesk.deb https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb
-    sudo apt install -y /tmp/rustdesk.deb
-    rm /tmp/rustdesk.deb
-    sudo systemctl enable --now rustdesk
-else
-    echo "RustDesk já está instalado."
-fi
-
-# 5. Instalar Scrcpy (Snap)
-echo "Verificando Scrcpy..."
-if ! snap list scrcpy &> /dev/null; then
-    echo "Instalando Scrcpy (Snap)..."
-    sudo snap install scrcpy
-else
-    echo "Scrcpy já instalado."
-fi
-
-# 6. Criar Script de Espelhamento Automático (USB/Wi-Fi)
-echo "Criando Script de Espelhamento Inteligente..."
-SCRIPT_DIR="/home/lucas/Downloads/espelhar_celular_usb_wifi_linux"
-mkdir -p "$SCRIPT_DIR"
-SCRIPT_PATH="$SCRIPT_DIR/espelhar_auto.sh"
-
-cat << 'EOF' > "$SCRIPT_PATH"
-#!/bin/bash
-
-# Configurações
-IP_CELULAR="192.168.0.24" # O script tenta achar o IP, mas esse é o padrão
-echo "=== Monitoramento Iniciado ==="
-echo "Plugue o USB para qualidade máxima. Tire para modo Wi-Fi."
-
-PID_WIFI=""
-
-while true; do
-    # 1. Verifica se tem USB conectado (Ignora IPs de rede)
-    if adb devices | grep -v "192.168" | grep -v "List" | grep -q "device$"; then
-        
-        # Se o Wi-Fi estiver rodando, fecha ele
-        if [ -n "$PID_WIFI" ] && kill -0 "$PID_WIFI" 2>/dev/null; then
-            echo "USB Detectado! Fechando janela Wi-Fi..."
-            kill "$PID_WIFI"
-            wait "$PID_WIFI" 2>/dev/null
-            PID_WIFI=""
-        fi
-
-        # Roda o Scrcpy USB (HD) - Bloqueia o loop até fechar
-        echo ">>> Abrindo USB (HD)..."
-        /snap/bin/scrcpy -d --stay-awake --turn-screen-off --window-title="Scrcpy_USB_Ultra"
-        
-        echo "USB desconectado ou fechado."
-        sleep 2
-
-    else
-        # 2. Modo Wi-Fi
-        
-        # Tenta conectar no ADB Wi-Fi se não estiver
-        if ! adb devices | grep -q "5555"; then
-             # Tenta conectar nos IPs conhecidos se o fixo falhar
-             adb connect "$IP_CELULAR:5555" >/dev/null
-             adb connect 192.168.0.12:5555 >/dev/null
-             adb connect 192.168.0.13:5555 >/dev/null
-        fi
-
-        # Se a janela Wi-Fi NÃO estiver aberta, abre ela
-        if [ -z "$PID_WIFI" ] || ! kill -0 "$PID_WIFI" 2>/dev/null; then
-            echo ">>> Abrindo Wi-Fi (Leve)..."
-            # Modo Otimizado: 400p, 400Kbps, 20fps, Codec H264
-            /snap/bin/scrcpy -e --no-audio -m 400 -b 400K --max-fps 20 --video-codec=h264 --stay-awake --turn-screen-off --window-title="Scrcpy_WIFI_Leve" &
-            PID_WIFI=$!
-        fi
-        
-        sleep 2
-    fi
-done
+Sobrescritas para teste: TARGET_HOME, STATE_DIR, APP_DIR, GCP_INSTANCE, GCP_ZONE, GCP_KEY_FILE.
 EOF
+}
 
-chmod +x "$SCRIPT_PATH"
+die() { printf '%b[erro]%b %s\n' "$RED" "$NC" "$1" >&2; exit 1; }
+applied() { printf 'aplicado: %s\n' "$*"; }
+already() { printf 'ja ok: %s\n' "$*"; }
+removed() { printf 'removido: %s\n' "$*"; }
+already_off() { printf 'ja desabilitado: %s\n' "$*"; }
 
-# Criar atalho no Menu de Aplicativos
-echo "Criando atalho no menu..."
-cat << EOF > ~/.local/share/applications/espelhar_auto.desktop
+report() {
+    if [[ "$1" == ok ]]; then
+        printf '[ok] %s\n' "$2"
+    else
+        printf '[faltando] %s: %s\n' "$2" "$3"
+        STATUS_FAIL=1
+    fi
+}
+
+package_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+unit_on() {
+    systemctl is-enabled --quiet "$1" 2>/dev/null && systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+unit_any() {
+    systemctl is-enabled --quiet "$1" 2>/dev/null || systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+# ssh pode se chamar ssh ou sshd conforme a distribuição
+ssh_unit() {
+    if systemctl list-unit-files ssh.service >/dev/null 2>&1 && systemctl list-unit-files ssh.service | grep -q ssh.service; then
+        printf 'ssh\n'
+    else
+        printf 'sshd\n'
+    fi
+}
+
+gen_launcher() {
+    cat <<EOF
 [Desktop Entry]
 Type=Application
 Name=Espelhar Celular (Auto)
-Exec=$SCRIPT_PATH
+Exec=$MIRROR_SCRIPT
 Icon=phone
 Terminal=true
 Categories=Utility;Mobile;
 Comment=Alterna automaticamente entre USB (HD) e Wi-Fi (Leve)
 EOF
+}
 
-sudo update-desktop-database
+launcher_ok() { [[ -f "$LAUNCHER" ]] && gen_launcher | cmp -s - "$LAUNCHER"; }
 
-echo -e "${GREEN}Configuração Local Concluída!${NC}"
+# Regras ufw já adicionadas (ufw show added precisa de root; vazio se indisponível).
+ufw_added_rules() {
+    sudo -n ufw show added 2>/dev/null | sed -n 's/^ufw allow //p' || true
+}
 
+ufw_has_rule() { printf '%s\n' "$1" | grep -qxF "$2"; }
 
-# ==============================================================================
-# PARTE 2: SERVIDOR RUSTDESK NA NUVEM (GCP)
-# ==============================================================================
+# ---------------------------------------------------------------------------
+# Parte local
+# ---------------------------------------------------------------------------
 
-echo -e "\n${GREEN}[PARTE 2] Servidor RustDesk Próprio (Google Cloud)${NC}"
-read -p "Deseja configurar seu servidor próprio na nuvem agora? (s/N): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Ss]$ ]]; then
-    echo "Instalação finalizada. Aproveite seu PC configurado!"
-    exit 0
-fi
+do_enable() {
+    local missing=() pkg rule added newly_added=()
 
-# 1. Verificar GCloud SDK
-if ! command -v gcloud &> /dev/null; then
-    echo -e "${RED}Erro: gcloud CLI não encontrado.${NC}"
-    echo "Instalando gcloud..."
-    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
-    sudo apt update && sudo apt install google-cloud-cli -y
-fi
+    for pkg in "${PACKAGES[@]}"; do
+        package_installed "$pkg" || missing+=("$pkg")
+    done
+    if ((${#missing[@]} == 0)); then
+        already "pacotes (${PACKAGES[*]})"
+    else
+        sudo apt update && sudo apt install -y "${missing[@]}" || die "falha ao instalar ${missing[*]}"
+        applied "pacotes instalados: ${missing[*]}"
+    fi
 
-# 2. Autenticação
-KEY_FILE="$SCRIPT_DIR/gemini-gcloud-key.json"
-if [ -f "$KEY_FILE" ]; then
-    echo "Autenticando com chave JSON encontrada..."
-    gcloud auth activate-service-account --key-file="$KEY_FILE"
-else
-    echo "Chave não encontrada em $KEY_FILE."
-    echo "Por favor, faça login manualmente:"
-    gcloud auth login
-fi
+    local ssh
+    ssh="$(ssh_unit)"
+    if unit_on "$ssh"; then
+        already "SSH ($ssh) habilitado e ativo"
+    else
+        sudo systemctl enable --now "$ssh" && applied "SSH ($ssh) habilitado e ativo"
+    fi
 
-# Selecionar Projeto
-PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
-if [ -z "$PROJECT_ID" ]; then
-    echo -e "${RED}Nenhum projeto selecionado.${NC}"
-    read -p "Digite o ID do seu Projeto Google Cloud: " PROJECT_ID
-    gcloud config set project "$PROJECT_ID"
-fi
+    # Firewall: só as regras que faltam; as adicionadas aqui ficam registradas para o disable.
+    added="$(sudo ufw show added 2>/dev/null | sed -n 's/^ufw allow //p' || true)"
+    mkdir -p "$STATE_DIR"
+    for rule in "${UFW_RULES[@]}"; do
+        if ufw_has_rule "$added" "$rule"; then
+            already "ufw allow $rule"
+        else
+            sudo ufw allow "$rule" >/dev/null && applied "ufw allow $rule"
+            printf '%s\n' "$rule" >> "$UFW_STATE"
+            newly_added+=("$rule")
+        fi
+    done
+    if ((${#newly_added[@]} > 0)); then
+        sudo ufw reload >/dev/null || true
+    fi
 
-echo -e "${GREEN}Usando Projeto: $PROJECT_ID${NC}"
+    # RustDesk (pacote .deb do GitHub) e serviço
+    if package_installed rustdesk; then
+        already "pacote rustdesk"
+    else
+        local deb="$STATE_DIR/downloads/rustdesk-${RUSTDESK_VERSION}.deb"
+        mkdir -p "$(dirname "$deb")"
+        wget -q -O "$deb" "$RUSTDESK_URL" || die "falha ao baixar $RUSTDESK_URL"
+        sudo apt install -y "$deb" || die "falha ao instalar o RustDesk"
+        rm -f "$deb"
+        applied "pacote rustdesk ${RUSTDESK_VERSION}"
+    fi
+    if unit_on rustdesk; then
+        already "serviço rustdesk habilitado e ativo"
+    else
+        sudo systemctl enable --now rustdesk && applied "serviço rustdesk habilitado e ativo"
+    fi
 
-# 3. Criar Regras de Firewall
-echo "Configurando Firewall no GCP..."
-gcloud compute firewall-rules create allow-rustdesk \
-    --allow tcp:21115-21119,udp:21116 \
-    --description="Permitir portas do RustDesk" \
-    --direction=INGRESS 2>/dev/null || echo "Regra de firewall já existe."
+    # scrcpy (snap)
+    if snap list scrcpy >/dev/null 2>&1; then
+        already "scrcpy (snap)"
+    else
+        sudo snap install scrcpy && applied "scrcpy (snap)"
+    fi
 
-# 4. Criar VM (e2-micro - Grátis nos EUA)
-INSTANCE_NAME="rustdesk-server"
-ZONE="us-central1-f" # Zona elegível para free tier
+    # Script de espelhamento: fonte única é espelhar_auto.sh, versionado ao lado deste instalador.
+    [[ -x "$MIRROR_SCRIPT" ]] || die "$MIRROR_SCRIPT ausente ou sem permissão de execução"
+    already "script de espelhamento ($MIRROR_SCRIPT)"
 
-echo "Criando Máquina Virtual ($INSTANCE_NAME)..."
-# Script de inicialização que instala o RustDesk Server (hbbs/hbbr) automaticamente
-STARTUP_SCRIPT='#! /bin/bash
+    if launcher_ok; then
+        already "atalho no menu ($LAUNCHER)"
+    else
+        mkdir -p "$APP_DIR"
+        gen_launcher > "$LAUNCHER"
+        update-desktop-database "$APP_DIR" 2>/dev/null || true
+        applied "atalho no menu ($LAUNCHER)"
+    fi
+}
+
+do_disable() {
+    local ssh rule remaining=""
+
+    ssh="$(ssh_unit)"
+    if unit_any rustdesk; then
+        sudo systemctl disable --now rustdesk
+        removed "serviço rustdesk parado e desabilitado"
+    else
+        already_off "serviço rustdesk"
+    fi
+
+    # SSH pode ter sido habilitado antes deste script e ser usado por outras coisas: não é desabilitado.
+    printf 'mantido: SSH (%s) (pode ser usado fora deste instalador; desabilite à mão se quiser)\n' "$ssh"
+
+    if [[ -f "$UFW_STATE" ]]; then
+        while IFS= read -r rule; do
+            [[ -n "$rule" ]] || continue
+            if sudo ufw delete allow "$rule" >/dev/null 2>&1; then
+                removed "ufw allow $rule"
+            else
+                remaining="$remaining$rule"$'\n'
+                printf 'aviso: não consegui remover ufw allow %s (rode de novo com sudo disponível)\n' "$rule" >&2
+            fi
+        done < "$UFW_STATE"
+        if [[ -n "$remaining" ]]; then
+            printf '%s' "$remaining" > "$UFW_STATE"
+        else
+            rm -f "$UFW_STATE"
+        fi
+    else
+        already_off "regras de firewall adicionadas por este script"
+    fi
+
+    if [[ -e "$LAUNCHER" ]]; then
+        rm -f "$LAUNCHER"
+        update-desktop-database "$APP_DIR" 2>/dev/null || true
+        removed "atalho no menu"
+    else
+        already_off "atalho no menu"
+    fi
+}
+
+do_status() {
+    local pkg ssh rule added
+
+    for pkg in "${PACKAGES[@]}"; do
+        if package_installed "$pkg"; then report ok "pacote $pkg"; else report faltando "pacote $pkg" "não instalado"; fi
+    done
+    ssh="$(ssh_unit)"
+    if unit_on "$ssh"; then report ok "SSH ($ssh) habilitado e ativo"; else report faltando "SSH ($ssh)" "desabilitado ou inativo"; fi
+
+    added="$(ufw_added_rules)"
+    if [[ -z "$added" ]]; then
+        report faltando "regras ufw" "não verificável sem sudo sem senha (rode: sudo ufw show added)"
+    else
+        for rule in "${UFW_RULES[@]}"; do
+            if ufw_has_rule "$added" "$rule"; then report ok "ufw allow $rule"; else report faltando "ufw allow $rule" "ausente"; fi
+        done
+    fi
+
+    if package_installed rustdesk; then report ok "pacote rustdesk"; else report faltando "pacote rustdesk" "não instalado"; fi
+    if unit_on rustdesk; then report ok "serviço rustdesk habilitado e ativo"; else report faltando "serviço rustdesk" "desabilitado ou inativo"; fi
+    if snap list scrcpy >/dev/null 2>&1; then report ok "scrcpy (snap)"; else report faltando "scrcpy (snap)" "não instalado"; fi
+    if [[ -x "$MIRROR_SCRIPT" ]]; then report ok "script de espelhamento"; else report faltando "script de espelhamento" "$MIRROR_SCRIPT ausente ou sem execução"; fi
+    if launcher_ok; then report ok "atalho no menu"; else report faltando "atalho no menu" "$LAUNCHER ausente ou diferente"; fi
+    return "$STATUS_FAIL"
+}
+
+# ---------------------------------------------------------------------------
+# Parte nuvem (GCP): sem perguntas; o projeto vem do gcloud ou de GCP_PROJECT_ID
+# ---------------------------------------------------------------------------
+
+gcp_project() {
+    local project
+    project="$(gcloud config get-value project 2>/dev/null || true)"
+    printf '%s\n' "${project:-${GCP_PROJECT_ID:-}}"
+}
+
+gcp_firewall_exists() { gcloud compute firewall-rules describe "$GCP_FIREWALL_RULE" >/dev/null 2>&1; }
+gcp_vm_exists() { gcloud compute instances describe "$GCP_INSTANCE" --zone="$GCP_ZONE" >/dev/null 2>&1; }
+gcp_vm_ip() { gcloud compute instances describe "$GCP_INSTANCE" --zone="$GCP_ZONE" --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null; }
+
+gcp_require_gcloud() {
+    command -v gcloud >/dev/null 2>&1 || die "gcloud CLI não encontrado (instale com: sudo snap install google-cloud-cli --classic)"
+}
+
+gcp_ensure_auth() {
+    if [[ -n "$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)" ]]; then
+        already "gcloud autenticado"
+        return
+    fi
+    if [[ -f "$GCP_KEY_FILE" ]]; then
+        gcloud auth activate-service-account --key-file="$GCP_KEY_FILE" || die "falha ao autenticar com $GCP_KEY_FILE"
+        applied "gcloud autenticado com a chave de serviço"
+    else
+        die "gcloud sem conta ativa e sem chave em $GCP_KEY_FILE; rode: gcloud auth login"
+    fi
+}
+
+gcp_do_status() {
+    gcp_require_gcloud
+    local project
+    project="$(gcp_project)"
+    if [[ -n "$project" ]]; then report ok "projeto GCP: $project"; else report faltando "projeto GCP" "nenhum selecionado (gcloud config set project ID ou GCP_PROJECT_ID)"; fi
+    if gcp_firewall_exists; then report ok "regra de firewall $GCP_FIREWALL_RULE"; else report faltando "regra de firewall $GCP_FIREWALL_RULE" "ausente"; fi
+    if gcp_vm_exists; then report ok "VM $GCP_INSTANCE ($GCP_ZONE)"; else report faltando "VM $GCP_INSTANCE" "ausente"; fi
+    return "$STATUS_FAIL"
+}
+
+gcp_do_enable() {
+    gcp_require_gcloud
+    gcp_ensure_auth
+
+    local project
+    project="$(gcp_project)"
+    [[ -n "$project" ]] || die "nenhum projeto GCP selecionado: use gcloud config set project ID ou GCP_PROJECT_ID=ID"
+    if [[ "$(gcloud config get-value project 2>/dev/null || true)" != "$project" ]]; then
+        gcloud config set project "$project" >/dev/null
+        applied "projeto GCP: $project"
+    else
+        already "projeto GCP: $project"
+    fi
+
+    if gcp_firewall_exists; then
+        already "regra de firewall $GCP_FIREWALL_RULE"
+    else
+        gcloud compute firewall-rules create "$GCP_FIREWALL_RULE" \
+            --allow tcp:21115-21119,udp:21116 \
+            --description="Permitir portas do RustDesk" \
+            --direction=INGRESS || die "falha ao criar a regra de firewall"
+        applied "regra de firewall $GCP_FIREWALL_RULE"
+    fi
+
+    if gcp_vm_exists; then
+        already "VM $GCP_INSTANCE ($GCP_ZONE)"
+    else
+        # Script de inicialização que instala o RustDesk Server (hbbs/hbbr) automaticamente
+        local startup_script='#! /bin/bash
 wget https://raw.githubusercontent.com/techahold/rustdesk-install/master/install.sh
 chmod +x install.sh
 ./install.sh
 '
+        gcloud compute instances create "$GCP_INSTANCE" \
+            --project="$project" \
+            --zone="$GCP_ZONE" \
+            --machine-type=e2-micro \
+            --network-interface=network-tier=PREMIUM,subnet=default \
+            --metadata=startup-script="$startup_script" \
+            --tags=http-server,https-server \
+            --image-family=ubuntu-2204-lts \
+            --image-project=ubuntu-os-cloud \
+            --boot-disk-size=30GB \
+            --boot-disk-type=pd-standard || die "falha ao criar a VM"
+        applied "VM $GCP_INSTANCE ($GCP_ZONE) criada; a instalação do servidor leva 2-3 minutos"
+    fi
 
-gcloud compute instances create "$INSTANCE_NAME" \
-    --project="$PROJECT_ID" \
-    --zone="$ZONE" \
-    --machine-type=e2-micro \
-    --network-interface=network-tier=PREMIUM,subnet=default \
-    --metadata=startup-script="$STARTUP_SCRIPT" \
-    --tags=http-server,https-server \
-    --image-family=ubuntu-2204-lts \
-    --image-project=ubuntu-os-cloud \
-    --boot-disk-size=30GB \
-    --boot-disk-type=pd-standard \
-    2>/dev/null || echo "VM já existe ou erro na criação."
+    local ip
+    ip="$(gcp_vm_ip)"
+    printf 'Servidor de ID e Relay: %s (API Server: deixe vazio)\n' "${ip:-indisponível}"
+    printf 'Chave pública, depois de 1 a 2 minutos:\n'
+    printf "  gcloud compute ssh %s --zone=%s --command='cat /opt/rustdesk/hbbs/id_ed25519.pub'\n" "$GCP_INSTANCE" "$GCP_ZONE"
+}
 
-# 5. Pegar Informações
-echo -e "${GREEN}Aguardando a VM iniciar e instalar (pode levar 2-3 minutos)...${NC}"
-sleep 10
+gcp_do_disable() {
+    gcp_require_gcloud
+    if [[ "${1:-}" != "--confirm-delete" ]]; then
+        die "gcp-disable APAGA a VM $GCP_INSTANCE e a regra $GCP_FIREWALL_RULE no GCP; repita com --confirm-delete"
+    fi
 
-EXTERNAL_IP=$(gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+    if gcp_vm_exists; then
+        gcloud compute instances delete "$GCP_INSTANCE" --zone="$GCP_ZONE" --quiet && removed "VM $GCP_INSTANCE"
+    else
+        already_off "VM $GCP_INSTANCE"
+    fi
+    if gcp_firewall_exists; then
+        gcloud compute firewall-rules delete "$GCP_FIREWALL_RULE" --quiet && removed "regra de firewall $GCP_FIREWALL_RULE"
+    else
+        already_off "regra de firewall $GCP_FIREWALL_RULE"
+    fi
+}
 
-echo -e "${GREEN}=== INSTALAÇÃO CONCLUÍDA! ===${NC}"
-echo ""
-echo "Seu Servidor RustDesk está rodando!"
-echo "-------------------------------------------------------"
-echo "ID Server (Servidor de ID):  $EXTERNAL_IP"
-echo "Relay Server (Servidor Relay): $EXTERNAL_IP"
-echo "API Server:                  (deixe vazio)"
-echo "-------------------------------------------------------"
-
-echo ""
-echo "Aguarde mais 1 minuto e rode este comando para pegar sua KEY (Chave):"
-echo "gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command='cat /opt/rustdesk/hbbs/id_ed25519.pub'"
-
+case "${1:-help}" in
+    status) do_status ;;
+    enable) do_enable ;;
+    disable) do_disable ;;
+    gcp-status) gcp_do_status ;;
+    gcp-enable) gcp_do_enable ;;
+    gcp-disable) shift; gcp_do_disable "${1:-}" ;;
+    help|-h|--help) usage ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
